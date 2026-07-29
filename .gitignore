@@ -9,8 +9,6 @@ __pycache__/
 *.csv
 
 # Editor
-.vscode/*
-!.vscode/settings.json
 
 # Dataset contents (folders kept, files ignored)
 Dataset/real/*
@@ -20,3 +18,8 @@ Dataset/fake/*
 
 # Model checkpoints
 outputs/checkpoints/
+
+# Outputs (generated at runtime, folder kept via .gitkeep)
+outputs/*
+!outputs/.gitkeep
+.vscode/
