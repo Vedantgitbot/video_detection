@@ -13,6 +13,8 @@ Writes outputs/features.csv with columns matching train.py's FEATURE_COLS:
     jaw_velocity_mean, jaw_velocity_std, jaw_jitter_fft_energy,
     mouth_velocity_mean, mouth_velocity_std, mouth_jitter_fft_energy,
     overall_velocity_mean, overall_velocity_std, overall_jitter_fft_energy,
+    brow_raise_mean, brow_raise_std,
+    head_yaw_std, head_pitch_std, head_roll_std,
     av_sync_lag_ms, av_sync_confidence
 
 Requires ffmpeg on PATH for the audio-visual sync features (used to extract
@@ -117,12 +119,31 @@ RIGHT_EYE_OUTER = 263
 # Sparse but stable subset across the face, used for "overall" motion signal
 OVERALL_SUBSET = [1, 33, 61, 152, 263, 291, 199, 4]
 
+# --- Eyebrow landmarks (for brow-raise feature) -----------------------------
+# Mid-brow points, roughly above the pupil, paired with the nearest upper
+# eyelid point directly below each — the vertical gap between them is a
+# simple "brow aspect ratio" analogous to the existing eye-aspect-ratio (EAR).
+LEFT_EYEBROW_MID = 105
+RIGHT_EYEBROW_MID = 334
+LEFT_EYE_UPPER_LID = 159
+RIGHT_EYE_UPPER_LID = 386
+
+# --- Head pose proxy landmarks ----------------------------------------------
+# Lightweight geometric proxies for yaw/pitch/roll, not a full 3D solvePnP
+# pose estimate — cheap to compute per frame and sufficient for tracking
+# *stability* (frame-to-frame variance) rather than absolute pose angles.
+NOSE_TIP = 1
+FOREHEAD = 10
+
 EAR_BLINK_THRESHOLD = 0.21
 BLINK_REFRACTORY_FRAMES = 3  # minimum frames between counted blinks (avoid double count)
 
 # --- Audio-visual sync constants --------------------------------------------
 AV_SYNC_MAX_LAG_MS = 500.0   # search window: real lip-sync offsets are well under this
 AV_AUDIO_SAMPLE_RATE = 16000
+
+# --- Face-crop constants (used by vit.py for the appearance branch) --------
+FACE_CROP_MARGIN = 0.35  # fraction of face bbox size added as padding on each side
 
 
 def eye_aspect_ratio(landmarks, eye_idx):
@@ -134,6 +155,57 @@ def eye_aspect_ratio(landmarks, eye_idx):
     if horizontal < 1e-8:
         return 0.0
     return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+
+def brow_raise_ratio(landmarks, iod):
+    """
+    Vertical gap between mid-eyebrow and the eyelid directly below it,
+    averaged across both sides and normalized by inter-ocular distance (iod)
+    so it's comparable across faces at different scales — same normalization
+    convention as the rest of this file's motion features.
+
+    Larger values = eyebrows raised further from the eyes. Tracked over a
+    video as brow_raise_mean/std, the same way EAR is tracked for blinks;
+    the idea is that natural micro-expressions correlate brow movement with
+    the rest of the face, and that correlation can break down in generated
+    video where the brow may move too little (flat) or too erratically.
+    """
+    l_gap = landmarks[LEFT_EYE_UPPER_LID].y - landmarks[LEFT_EYEBROW_MID].y
+    r_gap = landmarks[RIGHT_EYE_UPPER_LID].y - landmarks[RIGHT_EYEBROW_MID].y
+    if iod < 1e-8:
+        return 0.0
+    return float(((l_gap + r_gap) / 2.0) / iod)
+
+
+def head_pose_proxy(landmarks, iod):
+    """
+    Cheap per-frame yaw/pitch/roll proxies from landmark geometry alone
+    (no camera intrinsics, no solvePnP). These are NOT calibrated pose
+    angles — they're relative signals meant to be tracked for *stability*
+    (std across a video) rather than compared as absolute values across
+    videos or used for anything requiring true angles.
+
+    roll:  angle of the line between the outer eye corners vs horizontal.
+    yaw:   horizontal offset of the nose tip from the eye-line midpoint,
+           normalized by iod — the nose shifts sideways as the head turns.
+    pitch: vertical offset of the nose tip from the eye-line midpoint,
+           normalized by iod — a coarse proxy for head tilt up/down.
+    """
+    l_outer = np.array([landmarks[LEFT_EYE_OUTER].x, landmarks[LEFT_EYE_OUTER].y])
+    r_outer = np.array([landmarks[RIGHT_EYE_OUTER].x, landmarks[RIGHT_EYE_OUTER].y])
+    nose = np.array([landmarks[NOSE_TIP].x, landmarks[NOSE_TIP].y])
+
+    eye_mid = (l_outer + r_outer) / 2.0
+    eye_vec = r_outer - l_outer
+
+    roll = float(np.degrees(np.arctan2(eye_vec[1], eye_vec[0])))
+
+    if iod < 1e-8:
+        return roll, 0.0, 0.0
+
+    yaw = float((nose[0] - eye_mid[0]) / iod)
+    pitch = float((nose[1] - eye_mid[1]) / iod)
+    return roll, yaw, pitch
 
 
 def fft_jitter_energy(signal, high_freq_fraction=0.5):
@@ -287,6 +359,39 @@ def safe_resolve_video_path(base_dir: Path, candidate: Path) -> Path:
     return candidate_resolved
 
 
+def get_face_crop_bbox(landmarks, frame_width, frame_height, margin=FACE_CROP_MARGIN):
+    """
+    Computes a padded pixel bounding box around all face landmarks. Used to
+    produce a face crop for appearance-based models (e.g. ViT) that's aligned
+    with the same face detection used for motion features, rather than a
+    separately-tuned crop that could introduce inconsistency between the
+    motion and appearance branches.
+
+    Returns (x1, y1, x2, y2) in pixel coordinates, clamped to frame bounds.
+    """
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    box_w = x_max - x_min
+    box_h = y_max - y_min
+    pad_w = box_w * margin
+    pad_h = box_h * margin
+
+    x1 = max(0.0, x_min - pad_w)
+    y1 = max(0.0, y_min - pad_h)
+    x2 = min(1.0, x_max + pad_w)
+    y2 = min(1.0, y_max + pad_h)
+
+    return (
+        int(x1 * frame_width),
+        int(y1 * frame_height),
+        int(x2 * frame_width),
+        int(y2 * frame_height),
+    )
+
+
 def extract_video_features(video_path: Path, model_path: Path):
     """
     Runs MediaPipe FaceLandmarker (Tasks API, VIDEO mode) over a video and
@@ -308,6 +413,8 @@ def extract_video_features(video_path: Path, model_path: Path):
     frame_interval_ms = 1000.0 / fps
 
     ear_series = []
+    brow_series = []
+    yaw_series, pitch_series, roll_series = [], [], []
     jaw_pos, mouth_pos, overall_pos = [], [], []
     frame_count = 0
 
@@ -357,6 +464,13 @@ def extract_video_features(video_path: Path, model_path: Path):
                 ear = (eye_aspect_ratio(lm, RIGHT_EYE) + eye_aspect_ratio(lm, LEFT_EYE)) / 2.0
                 ear_series.append(ear)
 
+                brow_series.append(brow_raise_ratio(lm, iod))
+
+                roll, yaw, pitch = head_pose_proxy(lm, iod)
+                roll_series.append(roll)
+                yaw_series.append(yaw)
+                pitch_series.append(pitch)
+
                 jaw_pos.append(np.array([lm[CHIN].x, lm[CHIN].y]) / iod)
                 mouth_pos.append(
                     np.array([
@@ -400,6 +514,11 @@ def extract_video_features(video_path: Path, model_path: Path):
     duration_sec = frame_count / fps if fps > 0 else 1.0
     blink_rate = blinks / duration_sec if duration_sec > 0 else 0.0
 
+    brow_arr = np.array(brow_series)
+    yaw_arr = np.array(yaw_series)
+    pitch_arr = np.array(pitch_series)
+    roll_arr = np.array(roll_series)
+
     # --- Audio-visual sync features ---
     # Aligned against mouth_v (mouth-opening velocity), which is one shorter
     # than mouth_pos due to np.diff; audio envelope is extracted at the same
@@ -422,6 +541,11 @@ def extract_video_features(video_path: Path, model_path: Path):
         "overall_velocity_mean": float(np.mean(overall_v)) if len(overall_v) else 0.0,
         "overall_velocity_std": float(np.std(overall_v)) if len(overall_v) else 0.0,
         "overall_jitter_fft_energy": fft_jitter_energy(overall_v),
+        "brow_raise_mean": float(np.mean(brow_arr)),
+        "brow_raise_std": float(np.std(brow_arr)),
+        "head_yaw_std": float(np.std(yaw_arr)),
+        "head_pitch_std": float(np.std(pitch_arr)),
+        "head_roll_std": float(np.std(roll_arr)),
         "av_sync_lag_ms": av_features["av_sync_lag_ms"],
         "av_sync_confidence": av_features["av_sync_confidence"],
     }
